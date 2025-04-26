@@ -96,7 +96,7 @@ async function fetchQleverBackend(params, additionalHeaders = {}) {
 //
 // NOTE: A click on "Analysis" will show the runtime information from the last
 // query. See runtimeInfoForTreant in qleverUI.js.
-function appendRuntimeInformation(runtime_info, query, time, queryUpdate) {
+function appendRuntimeInformation(runtime_info, query, time, queryUpdate, isNoop = false) {
   // Backwards compatability hack in case the info on the execution tree is
   // not in a separate "query_execution_tree" element yet.
   if (runtime_info["query_execution_tree"] === undefined) {
@@ -106,10 +106,14 @@ function appendRuntimeInformation(runtime_info, query, time, queryUpdate) {
   }
 
   // Add query time to meta info.
-  runtime_info["meta"]["total_time_computing"] =
-    parseInt(time["computeResult"].toString().replace(/ms/, ""), 10);
-  runtime_info["meta"]["total_time"] =
-    parseInt(time["total"].toString().replace(/ms/, ""), 10);
+  if ("computeResult" in time) {
+    runtime_info["meta"]["total_time_computing"] =
+        parseInt(time["computeResult"].toString().replace(/ms/, ""), 10);
+  }
+  if ("total" in time) {
+    runtime_info["meta"]["total_time"] =
+        parseInt(time["total"].toString().replace(/ms/, ""), 10);
+  }
 
   const previousTimeStamp = request_log.get(queryUpdate.queryId)?.timeStamp || Number.MIN_VALUE;
   // If newer runtime info for existing query or new query.
@@ -117,7 +121,8 @@ function appendRuntimeInformation(runtime_info, query, time, queryUpdate) {
     request_log.set(queryUpdate.queryId, {
       timeStamp: queryUpdate.updateTimeStamp,
       runtime_info: runtime_info,
-      query: query
+      query: query,
+      isNoop: isNoop,
     });
     if (request_log.size > 10) {
       // Note: `keys().next()` is the key that was inserted first.
@@ -755,6 +760,12 @@ function expandEditor() {
   }
 }
 
+function displayInErrorBlock(message) {
+  $('#errorReason').html(message);
+  $('#errorBlock').show();
+  $('#answerBlock, #infoBlock, #updatedBlock').hide();
+}
+
 function displayError(response, queryId = undefined) {
   console.error("Either the GET request failed or the backend returned an error:", response);
   if (response["exception"] == undefined || response["exception"] == "") {
@@ -782,9 +793,7 @@ function displayError(response, queryId = undefined) {
       queryToDisplay = htmlEscape(queryToDisplay);
   }
   disp += "Your query was: " + "<br><pre>" + queryToDisplay + "</pre>";
-  $('#errorReason').html(disp);
-  $('#errorBlock').show();
-  $('#answerBlock, #infoBlock').hide();
+  displayInErrorBlock(disp);
 
   // If error response contains query and runtime info, append to runtime log.
   //
@@ -799,19 +808,23 @@ function displayError(response, queryId = undefined) {
   }
 }
 
-function displayWarning(result) {
-  console.warn('QLever returned warnings while processing request', result);
+function displayWarningsIfPresent(warnings) {
+  if (warnings.length === 0) {
+    return;
+  }
 
-  disp = "<h3>Warnings:</h3><ul>";
-  $(result['warnings']).each((el) => {
-    disp += '<li>' + result['warnings'][el] + '</li>';
-  })
+  console.warn('QLever returned warnings while processing request', warnings);
+
+  let disp = "<h3>Warnings:</h3><ul>";
+  warnings.forEach(warning => {
+    disp += '<li>' + warning + '</li>';
+  });
   $('#warningReason').html(disp + '</ul>');
   $('#warningBlock').show();
 }
 
 function displayStatus(str) {
-  $("#errorBlock,#answerBlock,#warningBlock").hide();
+  $("#errorBlock,#answerBlock,#warningBlock,#updatedBlock").hide();
   $("#info").html(str);
   $("#infoBlock").show();
 }

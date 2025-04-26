@@ -111,7 +111,7 @@ $(document).ready(function () {
     // somewhere in the query and if so, add it before the first `SELECT` or
     // `CONSTRUCT` (and move the cursor accordingly). If there is no `SELECT`
     // or `CONSTRUCT`, do nothing.
-    let select_or_construct_regex = /(^| )(SELECT|CONSTRUCT)/mi;
+    let select_or_construct_regex = /(^| )(SELECT|CONSTRUCT|DELETE|INSERT)/mi;
     if (FILLPREFIXES && select_or_construct_regex.test(editor.getValue())) {
       let queryString = editor.getValue();
       let newCursor = editor.getCursor();
@@ -333,13 +333,18 @@ $(document).ready(function () {
 
         // The default media type for the curl command line link is TSV, but for
         // CONSTRUCT queries use Turtle.
-        var mediaType = "text/tab-separated-values";
-        var apiCallCommandLineLabel = "Command line for TSV export (using curl)";
+        var mediaTypePost = "application/sparql-results+json";
+        var mediaTypeGet = "application/qlever-results+json";
         if (queryRewrittenAndNormalizedAndWithEscapedQuotes.match(/CONSTRUCT \{/)) {
-          mediaType = "text/turtle";
-          apiCallCommandLineLabel = apiCallCommandLineLabel.replace(/TSV/, "Turtle");
+          mediaTypePost = "text/turtle";
+          mediaTypeGet = "text/turtle";
         }
-        $("#apiCallCommandLineLabel").html(apiCallCommandLineLabel);
+        var apiCallCommandLineLabelPost =
+          "cURL command line for POST request (" + mediaTypePost + "):";
+        var apiCallCommandLineLabelGet =
+          "cURL command line for GET request (" + mediaTypeGet + "):";
+        $("#apiCallCommandLineLabelPost").html(apiCallCommandLineLabelPost);
+        $("#apiCallCommandLineLabelGet").html(apiCallCommandLineLabelGet);
 
         $(".ok-text").collapse("hide");
         $("#share").modal("show");
@@ -347,10 +352,13 @@ $(document).ready(function () {
         $("#prettyLinkExec").val(baseLocation + result.link + '?exec=true');
         $("#queryStringLink").val(baseLocation + "?" + result.queryString);
         $("#apiCallUrl").val(BASEURL + "?" + result.queryString);
-        $("#apiCallCommandLine").val("curl -s " + BASEURL.replace(/-proxy$/, "")
-          + " -H \"Accept: " + mediaType + "\""
+        $("#apiCallCommandLinePost").val("curl -s " + BASEURL.replace(/-proxy$/, "")
+          + " -H \"Accept: " + mediaTypePost + "\""
           + " -H \"Content-type: application/sparql-query\""
           + " --data \"" + queryRewrittenAndNormalizedAndWithEscapedQuotes + "\"");
+        $("#apiCallCommandLineGet").val("curl -s " + BASEURL.replace(/-proxy$/, "")
+          + " -H \"Accept: " + mediaTypeGet + "\""
+          + " --data-urlencode \"query=" + queryRewrittenAndNormalizedAndWithEscapedQuotes + "\"");
         $("#queryStringUnescaped").val(queryRewrittenAndNormalizedAndWithEscapedQuotes);
       }
     } catch (error) {
@@ -364,6 +372,21 @@ $(document).ready(function () {
     link.setSelectionRange(0, 99999); /*For mobile devices*/
     document.execCommand("copy");
     $(this).parent().parent().parent().find(".ok-text").collapse("show");
+  });
+
+  const accessToken = $("#access_token");
+
+  function updateBackendCommandVisibility() {
+    if (accessToken.val().trim() === "") {
+      $("#backend_commands").hide();
+    } else {
+      $("#backend_commands").show();
+    }
+  }
+
+  updateBackendCommandVisibility();
+  accessToken.on("input", function () {
+    updateBackendCommandVisibility();
   });
   
 });
@@ -493,221 +516,323 @@ function createWebSocketForQuery(queryId, startTimeStamp, query) {
   return ws;
 }
 
+function resetIndicator(element) {
+  const icon = $(element).find('.glyphicon');
+  icon.addClass('glyphicon-refresh');
+  icon.removeClass('glyphicon-remove');
+  icon.css('color', '');
+}
+
+function setRunningIndicator(element) {
+  const icon = $(element).find('.glyphicon');
+  icon.addClass('glyphicon-spin glyphicon-refresh');
+  icon.removeClass('glyphicon-remove');
+  icon.css('color', $(element).css('color'));
+}
+
+function removeRunningIndicator(element) {
+  const icon = $(element).find('.glyphicon');
+  icon.removeClass('glyphicon-spin');
+  if (icon.css("color") !== 'rgb(255, 0, 0)') {
+    icon.css('color', '');
+  }
+}
+
+function setErrorIndicator(element) {
+  const icon = $(element).find('.glyphicon');
+  icon.removeClass('glyphicon-refresh');
+  icon.addClass('glyphicon-remove');
+  icon.css('color', 'red');
+}
+
+// Executes a backend command (e.g. `clear-cache`).
+async function executeBackendCommand(command, element) {
+  log("Executing command: " + command);
+  let headers = {};
+  const access_token = $.trim($("#access_token").val());
+  if (access_token.length > 0)
+    headers["Authorization"] = `Bearer ${access_token}`;
+  const params = {"cmd": command};
+  setRunningIndicator(element);
+  try {
+    await fetchQleverBackend(params, headers);
+  } catch (error) {
+    setErrorIndicator(element)
+  } finally {
+    removeRunningIndicator(element);
+  }
+}
+
 // Process the given query.
 async function processQuery(sendLimit=0, element=$("#exebtn")) {
   log('Preparing query...', 'other');
   log('Element: ' + element, 'other');
   if (sendLimit >= 0) { displayStatus("Waiting for response..."); }
 
-  $(element).find('.glyphicon').addClass('glyphicon-spin glyphicon-refresh');
-  $(element).find('.glyphicon').removeClass('glyphicon-remove');
-  $(element).find('.glyphicon').css('color', $(element).css('color'));
+  setRunningIndicator(element);
   log('Sending request...', 'other');
 
-  // A negative value for `sendLimit` has the special meaning: clear the cache
-  // (without issuing a query). This is used in `backend/templates/index.html`,
-  // in the definition of the `oncklick` action for the "Clear cache" button.
-  // TODO: super ugly, find a better solution.
-  let nothingToShow = false;
-  var params = {};
-  if (sendLimit >= 0) {
-    var original_query = editor.getValue();
-    var query = await rewriteQuery(original_query, { "name_service": "if_checked" });
-    params["query"] = query;
-    if (sendLimit > 0) {
-      params["send"] = sendLimit;
-    }
-  } else {
-    params["cmd"] = "clear-cache";
-    nothingToShow = true;
+  let params = {};
+  let headers = {};
+  let operationType;
+  console.assert(sendLimit >= 0);
+  var original_query = editor.getValue();
+  var query = await rewriteQuery(original_query, {"name_service": "if_checked"});
+  operationType = determineOperationType(query);
+  console.log(`Determined operation type: ${operationType}`);
+  switch (operationType) {
+      // If we don't know the operation type, we assume it's a query.
+    case "Unknown":
+    case "Query":
+      params["query"] = query;
+      break;
+    case "Update":
+      params["update"] = query;
+      const access_token = $.trim($("#access_token").val());
+      if (access_token.length > 0) headers["Authorization"] = `Bearer ${access_token}`;
+      break
+    default:
+      console.log("Unknown operation type");
+      disp = "<h4><strong>Error processing operation</strong></h4>";
+      disp += "This should not happen. Please <a href='https://github.com/ad-freiburg/qlever-ui/issues/new'>report</a> this with the operation that triggered it.";
+      displayInErrorBlock(disp);
+      setErrorIndicator(element);
+      removeRunningIndicator(element);
+      return;
+  }
+  if (sendLimit > 0) {
+    params["send"] = sendLimit;
   }
 
-  const headers = {};
   let ws = null;
   let queryId = undefined;
-  if (!nothingToShow) {
-    if (currentlyActiveQueryWebSocket !== null) {
-      throw new Error("Started a new query before previous one finished!");
-    }
-    queryId = generateQueryId();
-    const startTimeStamp = Date.now();
-    signalQueryStart(queryId, startTimeStamp, params["query"]);
-    ws = createWebSocketForQuery(queryId, startTimeStamp, params["query"]);
-    currentlyActiveQueryWebSocket = ws;
-    headers["Query-Id"] = queryId;
+  if (currentlyActiveQueryWebSocket !== null) {
+    throw new Error("Started a new query before previous one finished!");
   }
-  
+  queryId = generateQueryId();
+  const startTimeStamp = Date.now();
+  signalQueryStart(queryId, startTimeStamp, params["query"]);
+  ws = createWebSocketForQuery(queryId, startTimeStamp, params["query"]);
+  currentlyActiveQueryWebSocket = ws;
+  headers["Query-Id"] = queryId;
+
   try {
-    const result = await fetchQleverBackend(params, headers);
+    let result = await fetchQleverBackend(params, headers);
     
     log('Evaluating and displaying results...', 'other');
 
-    // For non-query commands like "cmd=clear-cache" just remove the "Waiting
-    // for response box" and that's it.
-    if (nothingToShow) {
-      $("#infoBlock").hide();
-        return;
-    }
-
-    if (result.status == "ERROR") {
+    if (result.status === "ERROR") {
       displayError(result, queryId);
       return;
     }
-    if (result["warnings"].length > 0) { displayWarning(result); }
 
-    // Show some statistics (on top of the table).
-    //
-    // NOTE: The result size reported by QLever (in the
-    // application/qlever-results+json format) is the result size without
-    // without LIMIT.
-    var nofRows = result.res.length;
-    const [totalTime, computeTime, resolveTime] = getResultTime(result.time);
-    let resultSize = result.resultsize;
-    let limitMatch = result.query.match(/\bLIMIT\s+(\d+)\s*$/);
-    if (limitMatch) { resultSize = parseInt(limitMatch[1]); }
-    let resultSizeString = tsep(resultSize.toString());
-    $('#resultSize').html(resultSizeString);
-    $('#totalTime').html(totalTime);
-    $('#computationTime').html(computeTime);
-    $('#jsonTime').html(resolveTime);
-
-    const columns = result.selected;
-
-    // If more than predefined number of results, create "Show all" button
-    // (onclick action defined further down). 
-    let showAllButton = "";
-    if (nofRows < parseInt(resultSize)) {
-      showAllButton = "<a id=\"show-all\" class=\"btn btn-default\">"
-        + "<i class=\"glyphicon glyphicon-sort-by-attributes\"></i> "
-        + "Limited to " + nofRows + " results; show all " + resultSizeString + " results</a>";
-    }
-
-    // If the last column of the first result row contains a WKT literal,
-    // create "Map View" buttons.
-    let mapViewButtonVanilla = '';
-    let mapViewButtonPetri = '';
-    if (result.res.length > 0 && /wktLiteral/.test(result.res[0][columns.length - 1])) {
-      let mapViewUrlVanilla = 'http://qlever.cs.uni-freiburg.de/mapui/index.html?';
-      let params = new URLSearchParams({ query: normalizeQuery(query), backend: BASEURL });
-      mapViewButtonVanilla = `<a class="btn btn-default" href="${mapViewUrlVanilla}${params}" target="_blank"><i class="glyphicon glyphicon-map-marker"></i> Map view</a>`;
-      mapViewButtonPetri = `<a class="btn btn-default" href="${MAP_VIEW_BASE_URL}/?${params}" target="_blank"><i class="glyphicon glyphicon-map-marker"></i> Map view</a>`;
-    }
-
-    // Show the buttons (if there are any).
-    //
-    // TODO: Exactly which "MapView" buttons are shown depends on the
-    // instance. How is currently hard-coded. This should be configurable (in
-    // the Django configuration of the respective backend).
-    var res = "<div id=\"res\">";
-    if (showAllButton || (mapViewButtonVanilla && mapViewButtonPetri)) {
-      if (MAP_VIEW_BASE_URL.length > 0) {
-        res += `<div class="pull-right" style="margin-left: 1em;">${showAllButton} ${mapViewButtonPetri}</div>`;
-      } else {
-        res += `<div class="pull-right" style="margin-left: 1em;">${showAllButton}</div>`;
-      }
-    }
-
-    // Optionally show links to other SPARQL endpoints.
-    // NOTE: we want the *original* query here, as it appears in the editor,
-    // without the QLever-specific rewrites (see above).
-    if (SLUG.startsWith("wikidata")) {
-      const queryEncoded = encodeURIComponent(original_query);
-      const wdqsUrl = `https://query.wikidata.org/#${queryEncoded}`;
-      const wdqsButton = `<a class="btn btn-default" href="${wdqsUrl}" target="_blank"><i class="glyphicon glyphicon-link"></i> Query WDQS</a>`;
-      const virtuosoUrl = "http://wikidata.demo.openlinksw.com/sparql?";
-      const virtuosoParams = new URLSearchParams({
-        "default-graph-uri": "http://www.wikidata.org/",
-        "qtxt": original_query, // use "query" instead of "qtxt" to execute query directly
-        "format": "text/html",
-        "timeout": 0,
-        "signal_void": "on"
-      });
-      const virtuosoButton = `<a class="btn btn-default" href="${virtuosoUrl}${virtuosoParams}" target="_blank"><i class="glyphicon glyphicon-link"></i> Query Virtuoso</a>`;
-      res += `<div class="pull-right">${wdqsButton}</div>`;
-      res += `<div class="pull-right">${virtuosoButton}</div>`;
-    }
-    if (SLUG.startsWith("uniprot")) {
-      const virtuosoUrl = "http://sparql.uniprot.org/sparql?";
-      const virtuosoParams = new URLSearchParams({
-        "qtxt": original_query,
-        "format": "text/html",
-        "timeout": 0,
-        "signal_void": "on"
-      });
-      const virtuosoButton = `<a class="btn btn-default" href="${virtuosoUrl}${virtuosoParams}" target="_blank"><i class="glyphicon glyphicon-link"></i> Query Virtuoso</a>`;
-      res += `<div class="pull-right">${virtuosoButton}</div>`;
-    }
-    if (SLUG.startsWith("dbpedia")) {
-      const virtuosoUrl = "https://dbpedia.org/sparql?";
-      const virtuosoParams = new URLSearchParams({
-        "default-graph-uri": "http://dbpedia.org",
-        "qtxt": original_query, // use "query" instead of "qtxt" to execute query directly
-        "format": "text/html",
-        "timeout": 0,
-        "signal_void": "on"
-      });
-      const virtuosoButton = `<a class="btn btn-default" href="${virtuosoUrl}${virtuosoParams}" target="_blank"><i class="glyphicon glyphicon-link"></i> Query Virtuoso</a>`;
-      res += `<div class="pull-right">${virtuosoButton}</div>`;
-    }
-
-    // Leave some space to the actual result table.
-    res += "</div><br><br>";
-
-    $("#answer").html(res);
-    $("#show-all").click(() => processQuery().catch(error => log(error.message, "requests")));
-
-    var tableHead = $('#resTable thead');
-    var head = "<tr><th></th>";
-    for (var column of columns) {
-      if (column) { head += "<th>" + column + "</th>"; }
-    }
-    head += "</tr>";
-    tableHead.html(head);
-    var tableBody = $('#resTable tbody');
-    tableBody.html("");
-    var i = 1;
-    for (var resultLine of result.res) {
-      var row = "<tr>";
-      row += "<td>" + i + "</td>";
-      var j = 0;
-      for (var resultEntry of resultLine) {
-        if (resultEntry) {
-          const [formattedResultEntry, rightAlign] = getFormattedResultEntry(resultEntry, 50, j);
-          const tooltipText = htmlEscape(resultEntry).replace(/\"/g, "&quot;");
-          row += "<td" + (rightAlign ? " align=\"right\"" : "") + ">"
-                 + "<span data-toggle=\"tooltip\" title=\"" + tooltipText + "\">"
-                 + formattedResultEntry + "</span></td>";
-        } else {
-          row += "<td><span>-</span></td>";
+    switch (operationType) {
+      case "Update":
+        if (!Array.isArray(result)) {
+          result = [result];
         }
-        j++;
-      }
-      row += "</tr>";
-      tableBody.append(row);
-      i++;
+        // Collect warnings from all updates and display the unique ones.
+        const uniqueWarnings = [...new Set(result.map(result => result["warnings"]).flat())];
+        displayWarningsIfPresent(uniqueWarnings);
+
+        const operationMetadata = result.map(result => result["delta-triples"].operation);
+        $('#answerBlock, #infoBlock, #errorBlock').hide();
+        const totalInserted = operationMetadata.reduce((acc, elem) => acc + elem.inserted, 0);
+        const totalDeleted = operationMetadata.reduce((acc, elem) => acc + elem.deleted, 0);
+        let updateMessage = `Update successful (insert triples: ${totalInserted}, delete triples: ${totalDeleted}`;
+        if (result.length > 1) {
+          updateMessage += `, aggregated from ${result.length} updates)`;
+        } else {
+          updateMessage += ")";
+        }
+        $('#updateMetadata').html(updateMessage);
+        $('#updatedBlock').show();
+        $("html, body").animate({
+          scrollTop: $("#updatedBlock").scrollTop() + 500
+        }, 500);
+
+        // MAX_VALUE ensures this always has priority over the websocket updates
+        if (result.length > 0) {
+          appendRuntimeInformation(result.at(-1).runtimeInformation, result.at(-1).update, result.at(-1).time, {
+            queryId,
+            updateTimeStamp: Number.MAX_VALUE
+          });
+        } else {
+          appendRuntimeInformation({}, query, {}, {
+            queryId,
+            updateTimeStamp: Number.MAX_VALUE
+          }, true);
+        }
+        renderRuntimeInformationToDom();
+        // Reset any error state of the backend command buttons
+        resetIndicator($("#btnClearDeltaTriples"));
+        resetIndicator($("#btnClearCacheComplete"));
+        break
+        // The operation type wasn't detected. It was most likely syntactically invalid and resulted in an error while parsing. Display the result anyway in case some valid queries were not identified.
+      case "Unknown":
+        if (Array.isArray(result["warnings"])) {
+          result["warnings"].push("Could not determine operation type, defaulting to \"query\"");
+        }
+      case "Query":
+        // Display warnings.
+        displayWarningsIfPresent(result["warnings"]);
+
+        // Show some statistics (on top of the table).
+        //
+        // NOTE: The result size reported by QLever (in the
+        // application/qlever-results+json format) is the result size without
+        // LIMIT.
+        var nofRows = result.res.length;
+        const [totalTime, computeTime, resolveTime] = getResultTime(result.time);
+        let resultSize = result.resultsize;
+        let limitMatch = result.query.match(/\bLIMIT\s+(\d+)\s*$/);
+        if (limitMatch) {
+          resultSize = parseInt(limitMatch[1]);
+        }
+        let resultSizeString = tsep(resultSize.toString());
+        $('#resultSize').html(resultSizeString);
+        $('#totalTime').html(totalTime);
+        $('#computationTime').html(computeTime);
+        $('#jsonTime').html(resolveTime);
+
+        const columns = result.selected;
+
+        // If more than predefined number of results, create "Show all" button
+        // (onclick action defined further down).
+        let showAllButton = "";
+        if (nofRows < parseInt(resultSize)) {
+          showAllButton = "<a id=\"show-all\" class=\"btn btn-default\">"
+              + "<i class=\"glyphicon glyphicon-sort-by-attributes\"></i> "
+              + "Limited to " + nofRows + " results; show all " + resultSizeString + " results</a>";
+        }
+
+        // If the last column of the first result row contains a WKT literal,
+        // create "Map View" buttons.
+        let mapViewButtonVanilla = '';
+        let mapViewButtonPetri = '';
+        if (result.res.length > 0 && /wktLiteral/.test(result.res[0][columns.length - 1])) {
+          let mapViewUrlVanilla = 'http://qlever.cs.uni-freiburg.de/mapui/index.html?';
+          let params = new URLSearchParams({query: normalizeQuery(query), backend: BASEURL});
+          mapViewButtonVanilla = `<a class="btn btn-default" href="${mapViewUrlVanilla}${params}" target="_blank"><i class="glyphicon glyphicon-map-marker"></i> Map view</a>`;
+          mapViewButtonPetri = `<a class="btn btn-default" href="${MAP_VIEW_BASE_URL}/?${params}" target="_blank"><i class="glyphicon glyphicon-map-marker"></i> Map view</a>`;
+        }
+
+        // Show the buttons (if there are any).
+        //
+        // TODO: Exactly which "MapView" buttons are shown depends on the
+        // instance. How is currently hard-coded. This should be configurable (in
+        // the Django configuration of the respective backend).
+        var res = "<div id=\"res\">";
+        if (showAllButton || (mapViewButtonVanilla && mapViewButtonPetri)) {
+          if (MAP_VIEW_BASE_URL.length > 0) {
+            res += `<div class="pull-right" style="margin-left: 1em;">${showAllButton} ${mapViewButtonPetri}</div>`;
+          } else {
+            res += `<div class="pull-right" style="margin-left: 1em;">${showAllButton}</div>`;
+          }
+        }
+
+        // Optionally show links to other SPARQL endpoints.
+        // NOTE: we want the *original* query here, as it appears in the editor,
+        // without the QLever-specific rewrites (see above).
+        if (SLUG.startsWith("wikidata")) {
+          const queryEncoded = encodeURIComponent(original_query);
+          const wdqsUrl = `https://query.wikidata.org/#${queryEncoded}`;
+          const wdqsButton = `<a class="btn btn-default" href="${wdqsUrl}" target="_blank"><i class="glyphicon glyphicon-link"></i> Query WDQS</a>`;
+          const virtuosoUrl = "http://wikidata.demo.openlinksw.com/sparql?";
+          const virtuosoParams = new URLSearchParams({
+            "default-graph-uri": "http://www.wikidata.org/",
+            "qtxt": original_query, // use "query" instead of "qtxt" to execute query directly
+            "format": "text/html",
+            "timeout": 0,
+            "signal_void": "on"
+          });
+          const virtuosoButton = `<a class="btn btn-default" href="${virtuosoUrl}${virtuosoParams}" target="_blank"><i class="glyphicon glyphicon-link"></i> Query Virtuoso</a>`;
+          res += `<div class="pull-right">${wdqsButton}</div>`;
+          res += `<div class="pull-right">${virtuosoButton}</div>`;
+        }
+        if (SLUG.startsWith("uniprot")) {
+          const virtuosoUrl = "http://sparql.uniprot.org/sparql?";
+          const virtuosoParams = new URLSearchParams({
+            "qtxt": original_query,
+            "format": "text/html",
+            "timeout": 0,
+            "signal_void": "on"
+          });
+          const virtuosoButton = `<a class="btn btn-default" href="${virtuosoUrl}${virtuosoParams}" target="_blank"><i class="glyphicon glyphicon-link"></i> Query Virtuoso</a>`;
+          res += `<div class="pull-right">${virtuosoButton}</div>`;
+        }
+        if (SLUG.startsWith("dbpedia")) {
+          const virtuosoUrl = "https://dbpedia.org/sparql?";
+          const virtuosoParams = new URLSearchParams({
+            "default-graph-uri": "http://dbpedia.org",
+            "qtxt": original_query, // use "query" instead of "qtxt" to execute query directly
+            "format": "text/html",
+            "timeout": 0,
+            "signal_void": "on"
+          });
+          const virtuosoButton = `<a class="btn btn-default" href="${virtuosoUrl}${virtuosoParams}" target="_blank"><i class="glyphicon glyphicon-link"></i> Query Virtuoso</a>`;
+          res += `<div class="pull-right">${virtuosoButton}</div>`;
+        }
+
+        // Leave some space to the actual result table.
+        res += "</div><br><br>";
+
+        $("#answer").html(res);
+        $("#show-all").click(() => processQuery().catch(error => log(error.message, "requests")));
+
+        var tableHead = $('#resTable thead');
+        var head = "<tr><th></th>";
+        for (var column of columns) {
+          if (column) {
+            head += "<th>" + column + "</th>";
+          }
+        }
+        head += "</tr>";
+        tableHead.html(head);
+        var tableBody = $('#resTable tbody');
+        tableBody.html("");
+        var i = 1;
+        for (var resultLine of result.res) {
+          var row = "<tr>";
+          row += "<td>" + i + "</td>";
+          var j = 0;
+          for (var resultEntry of resultLine) {
+            if (resultEntry) {
+              const [formattedResultEntry, rightAlign] = getFormattedResultEntry(resultEntry, 50, j);
+              const tooltipText = htmlEscape(resultEntry).replace(/\"/g, "&quot;");
+              row += "<td" + (rightAlign ? " align=\"right\"" : "") + ">"
+                  + "<span data-toggle=\"tooltip\" title=\"" + tooltipText + "\">"
+                  + formattedResultEntry + "</span></td>";
+            } else {
+              row += "<td><span>-</span></td>";
+            }
+            j++;
+          }
+          row += "</tr>";
+          tableBody.append(row);
+          i++;
+        }
+        $('[data-toggle="tooltip"]').tooltip();
+        $('#infoBlock,#errorBlock,#updatedBlock').hide();
+        $('#answerBlock').show();
+        $("html, body").animate({
+          scrollTop: $("#resTable").scrollTop() + 500
+        }, 500);
+
+        // MAX_VALUE ensures this always has priority over the websocket updates
+        appendRuntimeInformation(result.runtimeInformation, result.query, result.time, { queryId, updateTimeStamp: Number.MAX_VALUE });
+        renderRuntimeInformationToDom();
     }
-    $('[data-toggle="tooltip"]').tooltip();
-    $('#infoBlock,#errorBlock').hide();
-    $('#answerBlock').show();
-    $("html, body").animate({
-      scrollTop: $("#resTable").scrollTop() + 500
-    }, 500);
-    
-    // MAX_VALUE ensures this always has priority over the websocket updates
-    appendRuntimeInformation(result.runtimeInformation, result.query, result.time, { queryId, updateTimeStamp: Number.MAX_VALUE });
-    renderRuntimeInformationToDom();
   } catch (error) {
-    $(element).find('.glyphicon').removeClass('glyphicon-refresh');
-    $(element).find('.glyphicon').addClass('glyphicon-remove');
-    $(element).find('.glyphicon').css('color', 'red');
+    setErrorIndicator(element);
     const errorContent = {
       "exception" : error.message || "Unknown error",
       "query": query
     };
-    displayError(errorContent, nothingToShow ? undefined : queryId);
+    displayError(errorContent, queryId);
   } finally {
     currentlyActiveQueryWebSocket = null;
-    $(element).find('.glyphicon').removeClass('glyphicon-spin');
+    removeRunningIndicator(element);
     // Make sure we have no socket that stays open forever
     if (ws) {
       closeWebSocket(ws);
@@ -778,8 +903,19 @@ function renderRuntimeInformationToDom(entry = undefined) {
   // Get the right entries from the runtime log.
   const {
     runtime_info,
-    query
+    query,
+    isNoop
   } = entry || Array.from(request_log.values()).pop();
+
+  // When the last operation was a noop, no runtime info is available.
+  if (isNoop) {
+    $("#result-query").text("");
+    $("#meta-info").text("");
+    const resultTree = $("#result-tree");
+    resultTree.text("No query analysis available, because the operation has no effect and was optimized out");
+    resultTree.css("color", "green");
+    return;
+  }
 
   if (runtime_info["query_execution_tree"] === null) {
     $("#result-query").text("");
@@ -798,7 +934,7 @@ function renderRuntimeInformationToDom(entry = undefined) {
   const time_index_scans_query_planning = "time_index_scans_query_planning" in meta_info
                                 ? formatInteger(meta_info["time_index_scans_query_planning"]) + " ms"
                                 : "[not available]";
-  const total_time_computing = formatInteger(meta_info["total_time_computing"]);
+  const total_time_computing = meta_info["total_time_computing"] ? formatInteger(meta_info["total_time_computing"]): "N/A";
   $("#meta-info").html(
     "<p>Time for query planning: " + time_query_planning +
     "<br/>Time for index scans during query planning: " + time_index_scans_query_planning +
